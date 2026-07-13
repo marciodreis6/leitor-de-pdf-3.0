@@ -1,6 +1,3 @@
-# -*- coding: utf-8 -*-
-from __future__ import annotations
-
 import base64
 from datetime import datetime
 from io import BytesIO
@@ -9,344 +6,629 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from remessa_parser import dataframe_to_excel_bytes, format_brl, parse_many, summarize
+from pallet_control import NFeParser, SEGMENTS
 
 
-st.set_page_config(page_title="Leitor de Remessas", page_icon="M", layout="wide")
+APP_DIR = Path(__file__).resolve().parent
+SPREADSHEET_PATH = APP_DIR / "controle_nf_paletes.xlsx"
+LOGO_PATH = APP_DIR / "assets" / "mdias_logo_white_transparent.png"
+SHEET_NAME = "NF Paletes"
+EXPORT_COLUMNS = [
+    "Data",
+    "NF Palete",
+    "Remessa",
+    "Segmento",
+    "Quantidade",
+    "Transportadora",
+    "Cliente",
+    "Tipo Operação",
+    "Chave de Acesso",
+]
+TEXT_COLUMNS = [
+    "Data",
+    "NF Palete",
+    "Remessa",
+    "Segmento",
+    "Transportadora",
+    "Cliente",
+    "Tipo Operação",
+    "Chave de Acesso",
+]
+LOGO_DATA_URI = (
+    "data:image/png;base64,"
+    + base64.b64encode(LOGO_PATH.read_bytes()).decode("ascii")
+)
 
 
-def image_data_uri(path: str) -> str:
-    image_path = Path(path)
-    encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
-    return f"data:image/png;base64,{encoded}"
+st.set_page_config(
+    page_title="Controle de NF de Paletes",
+    page_icon="📦",
+    layout="wide",
+)
 
 
-LOGO_DATA_URI = image_data_uri("assets/mdias-branco-logo-transparente.png")
+def empty_spreadsheet() -> pd.DataFrame:
+    return pd.DataFrame(columns=EXPORT_COLUMNS)
+
+
+def text_value(value) -> str:
+    if pd.isna(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def normalize_spreadsheet(dataframe: pd.DataFrame) -> pd.DataFrame:
+    normalized = dataframe.copy()
+    for column in EXPORT_COLUMNS:
+        if column not in normalized.columns:
+            normalized[column] = ""
+    for column in TEXT_COLUMNS:
+        normalized[column] = normalized[column].map(text_value).astype("string")
+    normalized["Quantidade"] = pd.to_numeric(
+        normalized["Quantidade"],
+        errors="coerce",
+    ).astype("Int64")
+    return normalized[EXPORT_COLUMNS]
+
+
+def load_spreadsheet() -> pd.DataFrame:
+    if not SPREADSHEET_PATH.exists():
+        return empty_spreadsheet()
+    dataframe = pd.read_excel(
+        SPREADSHEET_PATH,
+        sheet_name=SHEET_NAME,
+        dtype={
+            "NF Palete": str,
+            "Remessa": str,
+            "Segmento": str,
+            "Chave de Acesso": str,
+        },
+    )
+    return normalize_spreadsheet(dataframe)
+
+
+def spreadsheet_bytes(dataframe: pd.DataFrame) -> bytes:
+    dataframe = normalize_spreadsheet(dataframe)
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        dataframe.to_excel(writer, index=False, sheet_name=SHEET_NAME)
+        worksheet = writer.book[SHEET_NAME]
+        widths = {
+            "A": 13,
+            "B": 13,
+            "C": 13,
+            "D": 12,
+            "E": 12,
+            "F": 38,
+            "G": 42,
+            "H": 18,
+            "I": 48,
+        }
+        for column, width in widths.items():
+            worksheet.column_dimensions[column].width = width
+        worksheet.freeze_panes = "A2"
+        worksheet.auto_filter.ref = worksheet.dimensions
+    return output.getvalue()
+
+
+def save_spreadsheet(dataframe: pd.DataFrame) -> None:
+    SPREADSHEET_PATH.write_bytes(spreadsheet_bytes(dataframe))
+
+
+def preview_dataframe(results) -> pd.DataFrame:
+    rows = []
+    for result in results:
+        record = result.record
+        rows.append(
+            {
+                "Adicionar": record.identificada_palete,
+                "Data": (
+                    datetime.strptime(record.data_emissao, "%Y-%m-%d").strftime(
+                        "%d/%m/%Y"
+                    )
+                    if record.data_emissao
+                    else ""
+                ),
+                "NF Palete": record.nf_palete,
+                "Remessa": record.remessa,
+                "Segmento": record.segmento,
+                "Quantidade": record.quantidade_paletes,
+                "Transportadora": record.transportadora,
+                "Cliente": record.cliente,
+                "Tipo Operação": (
+                    "Transferência"
+                    if record.operacao.startswith("TRANSFER")
+                    else "Venda"
+                ),
+                "Chave de Acesso": record.chave_acesso,
+                "Avisos": " | ".join(result.warnings),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def merge_spreadsheet(current: pd.DataFrame, new_rows: pd.DataFrame) -> pd.DataFrame:
+    combined = normalize_spreadsheet(
+        pd.concat([current, new_rows[EXPORT_COLUMNS]], ignore_index=True)
+    )
+    has_access_key = combined["Chave de Acesso"].fillna("").astype(str).str.strip() != ""
+    with_key = combined[has_access_key].drop_duplicates(
+        subset=["Chave de Acesso"],
+        keep="last",
+    )
+    without_key = combined[~has_access_key].drop_duplicates(
+        subset=["Data", "NF Palete", "Remessa"],
+        keep="last",
+    )
+    combined = pd.concat([with_key, without_key], ignore_index=True)
+    combined["_data_ordem"] = pd.to_datetime(
+        combined["Data"],
+        format="%d/%m/%Y",
+        errors="coerce",
+    )
+    combined = combined.sort_values(
+        ["_data_ordem", "NF Palete"],
+        ascending=[False, False],
+        na_position="last",
+    )
+    return normalize_spreadsheet(
+        combined.drop(columns="_data_ordem").reset_index(drop=True)
+    )
+
+
+def add_to_spreadsheet(selected: pd.DataFrame) -> tuple[int, int, int]:
+    current = load_spreadsheet()
+    updated = merge_spreadsheet(current, selected)
+    save_spreadsheet(updated)
+    saved = load_spreadsheet()
+    if len(saved) != len(updated):
+        raise RuntimeError("A planilha nao foi atualizada corretamente.")
+    st.session_state["xml_preview"] = None
+    added = max(len(updated) - len(current), 0)
+    updated_count = len(selected) - added
+    return len(selected), added, updated_count
+
+
+def clear_all_data() -> None:
+    try:
+        if SPREADSHEET_PATH.exists():
+            SPREADSHEET_PATH.unlink()
+    except OSError as exc:
+        st.session_state["save_message"] = (
+            "error",
+            f"Não foi possível apagar a planilha. Feche o arquivo Excel e tente novamente: {exc}",
+        )
+        return
+
+    upload_version = st.session_state.get("upload_version", 0) + 1
+    for key in list(st.session_state):
+        del st.session_state[key]
+    st.session_state["upload_version"] = upload_version
+    st.session_state["save_message"] = (
+        "success",
+        "Todos os dados foram limpos. A aplicação está pronta para uma nova execução.",
+    )
 
 
 st.markdown(
     """
     <style>
     :root {
-        --brand-blue: #003b71;
-        --brand-blue-2: #075692;
-        --brand-gold: #d8a229;
-        --ink: #eaf2fb;
-        --text-soft: #a9bdd3;
-        --line: rgba(180, 205, 229, .22);
-        --panel: #ffffff;
-        --surface: #0d1824;
+        --mdias-bg: #07111c;
+        --mdias-bg-grid: #0b1724;
+        --mdias-panel: #0c2e4b;
+        --mdias-panel-soft: #0d2740;
+        --mdias-sidebar: #074575;
+        --mdias-line: #245a81;
+        --mdias-gold: #f7b917;
+        --mdias-blue: #006fb7;
+        --mdias-text: #ffffff;
+        --mdias-muted: #b7c9db;
     }
 
     .stApp {
+        color: var(--mdias-text);
         background:
-            linear-gradient(90deg, rgba(255, 255, 255, .035) 0 1px, transparent 1px 100%),
-            linear-gradient(180deg, #111820 0%, #0d1824 44%, #0a1420 100%);
-        background-size: 34px 34px, auto;
-        color: var(--ink);
-    }
-
-    [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, var(--brand-blue) 0%, #062f56 100%);
-        border-right: 0;
-    }
-
-    [data-testid="stSidebar"] * {
-        color: #ffffff !important;
-    }
-
-    [data-testid="stSidebar"] [data-testid="stFileUploader"] section {
-        background: rgba(255, 255, 255, .08);
-        border-color: rgba(255, 255, 255, .28);
-        border-radius: 8px;
+            linear-gradient(rgba(11, 23, 36, 0.93), rgba(11, 23, 36, 0.93)),
+            linear-gradient(90deg, rgba(255,255,255,0.045) 1px, transparent 1px),
+            linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px),
+            var(--mdias-bg);
+        background-size: auto, 72px 72px, 72px 72px, auto;
     }
 
     .block-container {
+        max-width: 1340px;
         padding-top: 2rem;
         padding-bottom: 3rem;
-        max-width: 1500px;
     }
 
-    h1, h2, h3, p, label, span {
+    [data-testid="stHeader"] {
+        background: #0b0f15;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, var(--mdias-sidebar), #06385f);
+        border-right: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    [data-testid="stSidebar"] * {
+        color: var(--mdias-text);
+    }
+
+    .app-hero {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 32px;
+        min-height: 140px;
+        margin: 0 0 30px;
+        padding: 28px 32px;
+        border: 1px solid var(--mdias-line);
+        border-radius: 8px;
+        background: linear-gradient(135deg, #0d3556 0%, #0b2a44 100%);
+        box-shadow: 0 18px 45px rgba(0, 0, 0, 0.25);
+    }
+
+    .brand-kicker {
+        color: var(--mdias-gold);
+        font-size: 0.76rem;
+        font-weight: 800;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        margin-bottom: 12px;
+    }
+
+    .app-hero h1 {
+        color: var(--mdias-text);
+        font-size: clamp(2rem, 3.1vw, 3rem);
+        line-height: 1.05;
+        margin: 0;
         letter-spacing: 0;
     }
 
-    .hero {
-        border: 1px solid var(--line);
-        border-top: 5px solid var(--brand-gold);
-        background: linear-gradient(135deg, rgba(8, 33, 57, .98) 0%, rgba(13, 47, 78, .96) 72%, rgba(7, 36, 62, .98) 100%);
-        padding: 20px 300px 20px 24px;
-        border-radius: 8px;
-        margin-bottom: 18px;
-        box-shadow: 0 10px 28px rgba(0, 0, 0, .22);
-        position: relative;
-        overflow: hidden;
-    }
-
-    .hero::after {
-        display: none;
-        content: "";
-        position: absolute;
-        right: -34px;
-        top: -28px;
-        width: 190px;
-        height: 190px;
-        border: 2px solid rgba(216, 162, 41, .45);
-        border-radius: 50%;
-    }
-
-    .brand-seal {
-        position: absolute;
-        right: 30px;
-        top: 22px;
-        display: block;
-        background: transparent;
+    .subtitle {
+        color: #d2e4f6;
+        font-size: 1.03rem;
+        margin: 14px 0 0;
     }
 
     .brand-logo {
-        width: 230px;
-        height: auto;
         display: block;
-        border-radius: 0;
-        box-shadow: none;
+        width: min(360px, 28vw);
+        min-width: 240px;
+        height: auto;
+        object-fit: contain;
+        filter: drop-shadow(0 10px 22px rgba(0, 0, 0, 0.28));
     }
 
-    .brand-name {
-        color: #d9a93a;
-        font-size: .78rem;
-        font-weight: 800;
-        text-transform: uppercase;
-        margin-bottom: 6px;
+    h2, h3, [data-testid="stMarkdownContainer"] h2, [data-testid="stMarkdownContainer"] h3 {
+        color: var(--mdias-text);
+        letter-spacing: 0;
     }
 
-    .hero-title {
-        font-size: 2rem;
-        font-weight: 800;
-        margin: 0 0 4px 0;
-        color: #ffffff;
+    .stMarkdown p, label, [data-testid="stCaptionContainer"] {
+        color: var(--mdias-muted);
     }
 
-    .hero-subtitle {
-        margin: 0;
-        color: var(--text-soft);
-        font-size: 1rem;
-    }
-
-    .kpi-grid {
-        display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-        gap: 12px;
-        margin: 14px 0 18px 0;
-    }
-
-    .kpi {
-        border: 1px solid rgba(130, 174, 213, .28);
-        border-left: 5px solid var(--brand-gold);
-        background: linear-gradient(135deg, rgba(12, 44, 74, .98), rgba(8, 31, 54, .98));
-        padding: 16px 18px;
+    [data-testid="stExpander"] {
+        border: 1px solid rgba(80, 127, 165, 0.58);
         border-radius: 8px;
-        min-height: 96px;
-        box-shadow: 0 8px 22px rgba(0, 0, 0, .18);
+        background: rgba(12, 46, 75, 0.35);
     }
 
-    .kpi-label {
-        color: #d9a93a;
-        font-size: .78rem;
-        font-weight: 700;
+    [data-testid="stFileUploader"] section {
+        border: 1px solid rgba(80, 127, 165, 0.7);
+        border-radius: 8px;
+        background: rgba(12, 46, 75, 0.58);
+    }
+
+    [data-testid="stFileUploader"] section:hover {
+        border-color: var(--mdias-gold);
+    }
+
+    [data-testid="stFileUploader"] button,
+    .stButton button,
+    .stDownloadButton button {
+        min-height: 42px;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        font-weight: 750;
+        letter-spacing: 0;
+    }
+
+    .stButton button[kind="primary"],
+    .stDownloadButton button[kind="primary"] {
+        background: var(--mdias-blue);
+        border-color: var(--mdias-blue);
+        color: var(--mdias-text);
+    }
+
+    .stButton button[kind="primary"]:hover,
+    .stDownloadButton button[kind="primary"]:hover {
+        background: #087fcf;
+        border-color: var(--mdias-gold);
+        color: var(--mdias-text);
+    }
+
+    .stButton button[kind="secondary"] {
+        background: rgba(12, 46, 75, 0.7);
+        color: var(--mdias-text);
+    }
+
+    .dashboard-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 18px;
+        margin: 18px 0 30px;
+    }
+    .dashboard-card {
+        position: relative;
+        overflow: hidden;
+        min-height: 112px;
+        background: linear-gradient(135deg, var(--mdias-panel) 0%, var(--mdias-panel-soft) 100%);
+        color: var(--mdias-text);
+        border: 1px solid var(--mdias-line);
+        border-left: 5px solid var(--mdias-gold);
+        border-radius: 8px;
+        padding: 22px 24px;
+        box-shadow: 0 14px 35px rgba(0, 0, 0, 0.2);
+    }
+    .dashboard-label {
+        color: var(--mdias-gold);
+        font-size: 0.78rem;
+        font-weight: 850;
         text-transform: uppercase;
-        margin-bottom: 8px;
+        margin-bottom: 18px;
     }
-
-    .kpi-value {
-        font-size: 1.55rem;
-        font-weight: 800;
-        white-space: nowrap;
-        color: #ffffff;
+    .dashboard-value {
+        color: var(--mdias-text);
+        font-size: 2.05rem;
+        font-weight: 850;
+        line-height: 1;
     }
-
-    .section-title {
-        margin: 24px 0 10px 0;
-        font-size: 1.05rem;
-        font-weight: 800;
-        color: #ffffff;
-    }
-
-    .hint {
-        color: var(--text-soft);
-        font-size: .9rem;
-        margin-top: -2px;
-    }
-
-    .empty-state {
-        color: var(--text-soft);
-        font-size: .92rem;
+    .dashboard-helper {
+        color: var(--mdias-muted);
+        font-size: 0.82rem;
         margin-top: 8px;
-        padding: 14px 0;
     }
 
-    div[data-testid="stDataFrame"] {
-        border: 1px solid var(--line);
+    [data-testid="stDataFrame"],
+    [data-testid="stDataEditor"] {
+        border: 1px solid rgba(80, 127, 165, 0.7);
         border-radius: 8px;
         overflow: hidden;
-        box-shadow: 0 10px 28px rgba(0, 0, 0, .22);
+        background: rgba(8, 13, 21, 0.7);
     }
 
-    .stDownloadButton button, .stButton button {
+    [data-testid="stAlert"] {
         border-radius: 8px;
-        border: 1px solid var(--brand-blue);
-        background: var(--brand-blue);
-        color: #ffffff;
-        font-weight: 800;
-        min-height: 34px;
-        padding: 4px 18px;
     }
 
-    .stDownloadButton button:hover, .stButton button:hover {
-        border-color: #002f5a;
-        background: #002f5a;
-        color: #ffffff;
+    hr {
+        border-color: rgba(255, 255, 255, 0.13);
+        margin: 2rem 0;
     }
 
-    div[data-testid="stAlert"] {
-        width: fit-content;
-        max-width: min(560px, 100%);
-        border-radius: 8px;
-        padding: 0;
-        margin: 8px 0 18px 0;
-    }
-
-    div[data-testid="stAlert"] > div {
-        padding: 8px 14px;
-    }
-
-    div[data-testid="stAlert"] p {
-        font-size: .86rem;
-        margin: 0;
-    }
-
-    div.stDownloadButton {
-        width: fit-content;
-        margin-top: 12px;
-    }
-
-    @media (max-width: 900px) {
-        .kpi-grid {
-            grid-template-columns: repeat(2, minmax(0, 1fr));
+    @media (max-width: 700px) {
+        .block-container {padding-top: 1rem;}
+        .app-hero {
+            align-items: flex-start;
+            flex-direction: column;
+            padding: 22px;
         }
-        .kpi-value {
-            font-size: 1.2rem;
+        .brand-logo {
+            width: min(300px, 78vw);
+            min-width: 0;
         }
-        .brand-seal {
-            display: none;
-        }
-        .hero {
-            padding-right: 24px;
-        }
+        .dashboard-grid {grid-template-columns: 1fr;}
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-
 st.markdown(
     f"""
-    <div class="hero">
-        <div class="brand-name">M. Dias Branco</div>
-        <div class="hero-title">Leitor de Remessas</div>
-        <p class="hero-subtitle">Manifestos PDF para planilha de cargas pendentes.</p>
-        <div class="brand-seal">
-            <img class="brand-logo" src="{LOGO_DATA_URI}" alt="M. Dias Branco">
+    <section class="app-hero">
+        <div>
+            <div class="brand-kicker">M. Dias Branco</div>
+            <h1>Controle Automatizado de NF de Paletes</h1>
+            <p class="subtitle">Importação de XML e atualização da planilha compartilhada.</p>
         </div>
-    </div>
+        <img class="brand-logo" src="{LOGO_DATA_URI}" alt="M. Dias Branco">
+    </section>
     """,
     unsafe_allow_html=True,
 )
 
+save_message = st.session_state.pop("save_message", None)
+if save_message:
+    message_type, message_text = save_message
+    if message_type == "warning":
+        st.warning(message_text)
+    elif message_type == "error":
+        st.error(message_text)
+    else:
+        st.success(message_text)
 
-with st.sidebar:
-    st.header("Arquivos")
-    uploaded_files = st.file_uploader(
-        "Envie um ou mais PDFs",
-        type=["pdf"],
-        accept_multiple_files=True,
+with st.expander("Reiniciar aplicação"):
+    confirm_clear = st.checkbox(
+        "Confirmo que desejo apagar a planilha e limpar todos os dados da tela.",
+        key="confirm_clear_all",
     )
-    st.divider()
-    st.caption("Faturamento - 432")
-    st.caption("Horario: America/Sao_Paulo")
+    if st.button(
+        "Limpar tudo",
+        disabled=not confirm_clear,
+        type="secondary",
+        use_container_width=True,
+        on_click=clear_all_data,
+    ):
+        pass
 
+uploaded_files = st.file_uploader(
+    "Selecione um ou mais XMLs de NF-e",
+    type=["xml"],
+    accept_multiple_files=True,
+    key=f"xml_uploader_{st.session_state.get('upload_version', 0)}",
+)
 
-if not uploaded_files:
-    st.markdown('<div class="empty-state">Aguardando PDF.</div>', unsafe_allow_html=True)
-    st.stop()
+if st.button("Processar XMLs", type="primary", disabled=not uploaded_files):
+    parser = NFeParser()
+    parsed = []
+    errors = []
+    for uploaded_file in uploaded_files:
+        try:
+            parsed.append(parser.parse(uploaded_file.getvalue(), uploaded_file.name))
+        except Exception as exc:
+            errors.append(f"{uploaded_file.name}: {exc}")
+    st.session_state["xml_preview"] = preview_dataframe(parsed)
+    st.session_state["xml_errors"] = errors
 
+xml_errors = st.session_state.get("xml_errors", [])
+invalid_structure_errors = [
+    error
+    for error in xml_errors
+    if "estrutura NF-e valida (infNFe)" in error
+]
+other_xml_errors = [
+    error
+    for error in xml_errors
+    if error not in invalid_structure_errors
+]
 
-files_for_parser = []
-for uploaded_file in uploaded_files:
-    files_for_parser.append((uploaded_file.name, BytesIO(uploaded_file.getvalue())))
+if invalid_structure_errors:
+    st.caption(
+        f"{len(invalid_structure_errors)} arquivo(s) ignorado(s) por não conterem "
+        "uma estrutura NF-e válida."
+    )
+if other_xml_errors:
+    with st.expander(f"Outros erros de processamento ({len(other_xml_errors)})"):
+        for error in other_xml_errors:
+            st.error(error)
 
-with st.spinner("Lendo manifestos e validando campos..."):
-    result = parse_many(files_for_parser)
+preview = st.session_state.get("xml_preview")
+if preview is not None and not preview.empty:
+    st.subheader("Revisão antes de adicionar")
+    edited = st.data_editor(
+        preview,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        column_config={
+            "Adicionar": st.column_config.CheckboxColumn(required=True),
+            "Segmento": st.column_config.SelectboxColumn(
+                options=list(SEGMENTS),
+                required=False,
+            ),
+            "Quantidade": st.column_config.NumberColumn(
+                min_value=0,
+                step=1,
+                format="%d",
+            ),
+            "Tipo Operação": st.column_config.SelectboxColumn(
+                options=["Transferência", "Venda"],
+                required=True,
+            ),
+            "Avisos": st.column_config.TextColumn(disabled=True, width="large"),
+            "Chave de Acesso": st.column_config.TextColumn(width="large"),
+        },
+        disabled=["Avisos"],
+        key="xml_editor",
+    )
 
-df = result.dataframe
+    selected = edited[edited["Adicionar"]].copy()
+    add_complete, add_anyway = st.columns(2)
+    with add_complete:
+        add_complete_clicked = st.button(
+            "Adicionar selecionados à planilha",
+            type="primary",
+            use_container_width=True,
+        )
+    with add_anyway:
+        add_anyway_clicked = st.button(
+            "Adicionar assim mesmo",
+            use_container_width=True,
+        )
 
-if df.empty:
-    st.warning("Nenhuma remessa valida foi encontrada nos PDFs enviados.")
-    st.stop()
+    if add_complete_clicked:
+        validation_errors = []
+        for index, row in selected.iterrows():
+            missing = [
+                column
+                for column in ("Data", "NF Palete", "Remessa", "Segmento", "Quantidade")
+                if pd.isna(row.get(column)) or str(row.get(column)).strip() == ""
+            ]
+            if missing:
+                validation_errors.append(
+                    f"Linha {index + 1}: preencha {', '.join(missing)}."
+                )
 
-summary = summarize(df)
+        if validation_errors:
+            for error in validation_errors:
+                st.error(error)
+        elif selected.empty:
+            st.warning("Selecione ao menos uma linha para adicionar.")
+        else:
+            processed, added, updated_count = add_to_spreadsheet(selected)
+            st.session_state["save_message"] = (
+                "success",
+                f"{processed} registro(s) processado(s): "
+                f"{added} novo(s) e {updated_count} atualizado(s).",
+            )
+            st.rerun()
+
+    if add_anyway_clicked:
+        if selected.empty:
+            st.warning("Selecione ao menos uma linha para adicionar.")
+        else:
+            processed, added, updated_count = add_to_spreadsheet(selected)
+            st.session_state["save_message"] = (
+                "warning",
+                f"{processed} registro(s) processado(s), incluindo incompletos: "
+                f"{added} novo(s) e {updated_count} atualizado(s).",
+            )
+            st.rerun()
+
+st.divider()
+st.subheader("Planilha compartilhada")
+spreadsheet = load_spreadsheet()
+
+total_pallets = int(
+    pd.to_numeric(spreadsheet["Quantidade"], errors="coerce").fillna(0).sum()
+)
 st.markdown(
     f"""
-    <div class="kpi-grid">
-        <div class="kpi">
-            <div class="kpi-label">Remessas</div>
-            <div class="kpi-value">{int(summary["remessas"])}</div>
+    <div class="dashboard-grid">
+        <div class="dashboard-card">
+            <div class="dashboard-label">Notas na planilha</div>
+            <div class="dashboard-value">{len(spreadsheet):,}</div>
+            <div class="dashboard-helper">Registros disponíveis para consulta</div>
         </div>
-        <div class="kpi">
-            <div class="kpi-label">Valor total</div>
-            <div class="kpi-value">R$ {format_brl(summary["valor"])}</div>
-        </div>
-        <div class="kpi">
-            <div class="kpi-label">Peso total</div>
-            <div class="kpi-value">{format_brl(summary["peso"])} kg</div>
-        </div>
-        <div class="kpi">
-            <div class="kpi-label">Volumes</div>
-            <div class="kpi-value">{int(summary["volume"]):,}</div>
+        <div class="dashboard-card">
+            <div class="dashboard-label">Total de paletes</div>
+            <div class="dashboard-value">{total_pallets:,}</div>
+            <div class="dashboard-helper">Soma das quantidades identificadas</div>
         </div>
     </div>
     """.replace(",", "."),
     unsafe_allow_html=True,
 )
 
-if result.issues:
-    with st.expander(f"Alertas ({len(result.issues)})", expanded=True):
-        issue_df = pd.DataFrame([issue.__dict__ for issue in result.issues])
-        st.dataframe(issue_df, use_container_width=True, hide_index=True)
-
-st.markdown('<div class="section-title">Resultado para colar ou baixar</div>', unsafe_allow_html=True)
-st.markdown('<div class="hint">Revise antes de baixar.</div>', unsafe_allow_html=True)
-
-edited_df = st.data_editor(
-    df,
+st.dataframe(
+    spreadsheet,
     use_container_width=True,
     hide_index=True,
-    num_rows="fixed",
-    column_config={
-        "PESO": st.column_config.TextColumn("PESO"),
-        "VALOR": st.column_config.TextColumn("VALOR"),
-        "VOLUME": st.column_config.TextColumn("VOLUME"),
-        "NOVA AGENDA": st.column_config.TextColumn("NOVA AGENDA"),
-    },
+    height=500,
 )
 
-download_name = f"prefat_{datetime.now().strftime('%d-%m-%Y_%H-%M')}.xlsx"
-excel_bytes = dataframe_to_excel_bytes(edited_df)
-
 st.download_button(
-    "Baixar XLSX",
-    data=excel_bytes,
-    file_name=download_name,
+    "Baixar planilha Excel",
+    data=spreadsheet_bytes(spreadsheet),
+    file_name="controle_nf_paletes.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=False,
+    disabled=spreadsheet.empty,
+    type="primary",
 )
